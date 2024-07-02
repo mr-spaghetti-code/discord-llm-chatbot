@@ -8,6 +8,7 @@ import requests
 from typing import Optional
 
 import discord
+import litellm
 from dotenv import load_dotenv
 from litellm import acompletion
 
@@ -17,14 +18,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
 )
 
-LLM_IS_LOCAL: bool = env["LLM"].startswith("local/")
-LLM_SUPPORTS_IMAGES: bool = any(x in env["LLM"] for x in ("claude-3", "gpt-4-turbo", "gpt-4o", "llava", "vision"))
-LLM_SUPPORTS_NAMES: bool = any(env["LLM"].startswith(x) for x in ("gpt", "openai/gpt"))
+litellm.set_verbose = env["VERBOSE"].lower() == "true"
+
+MAX_TOKENS = int(env["MAX_TOKENS"])
+TEMPERATURE = float(env["TEMPERATURE"])
+GUARDRAIL_SYSTEM_PROMPT = env["GUARDRAIL_SYSTEM_PROMPT"].replace('\\n', '\n')
+MIXED_MODEL_SYSTEM_PROMPT = env["MIXED_MODEL_SYSTEM_PROMPT"].replace('\\n', '\n')
+
+LLM_IS_LOCAL: bool = False
+LLM_SUPPORTS_IMAGES: bool = True
+LLM_SUPPORTS_NAMES: bool = True
 
 ALLOWED_FILE_TYPES = ("image", "text")
 ALLOWED_CHANNEL_TYPES = (discord.ChannelType.text, discord.ChannelType.public_thread, discord.ChannelType.private_thread, discord.ChannelType.private)
 ALLOWED_CHANNEL_IDS = tuple(int(id) for id in env["ALLOWED_CHANNEL_IDS"].split(",") if id)
 ALLOWED_ROLE_IDS = tuple(int(id) for id in env["ALLOWED_ROLE_IDS"].split(",") if id)
+ALLOWED_MODELS = set(env["ALLOWED_MODELS"].split(","))
 
 MAX_TEXT = int(env["MAX_TEXT"])
 MAX_IMAGES = int(env["MAX_IMAGES"]) if LLM_SUPPORTS_IMAGES else 0
@@ -36,14 +45,6 @@ EDIT_DELAY_SECONDS = 1.3
 MAX_MESSAGE_NODES = 100
 
 convert = lambda string: int(string) if string.isdecimal() else (float(string) if string.replace(".", "", 1).isdecimal() else string)
-llm_settings = {k.strip(): convert(v.strip()) for k, v in (x.split("=", 1) for x in env["LLM_SETTINGS"].split(",") if x.strip()) if "#" not in k}
-
-if LLM_IS_LOCAL:
-    llm_settings["base_url"] = env["LOCAL_SERVER_URL"]
-    if "api_key" not in llm_settings:
-        llm_settings["api_key"] = "Not used"
-
-    env["LLM"] = env["LLM"].replace("local/", "", 1)
 
 if env["DISCORD_CLIENT_ID"]:
     print(f"\nBOT INVITE URL:\nhttps://discord.com/api/oauth2/authorize?client_id={env['DISCORD_CLIENT_ID']}&permissions=412317273088&scope=bot\n")
@@ -71,14 +72,18 @@ class MsgNode:
 
 
 def get_system_prompt():
-    system_prompt_extras = [f"Today's date: {dt.now().strftime('%B %d %Y')}"]
+    now = dt.utcnow()
+    formatted_date = now.strftime('%a, %d %b %Y %H:%M:%S GMT')
+
+    final_system_prompt = [GUARDRAIL_SYSTEM_PROMPT + formatted_date, MIXED_MODEL_SYSTEM_PROMPT]
+
     if LLM_SUPPORTS_NAMES:
-        system_prompt_extras += ["User's names are their Discord IDs and should be typed as '<@ID>'."]
+        final_system_prompt += ["User's names are their Discord IDs and should be typed as '<@ID>'."]
 
     return [
         {
             "role": "system",
-            "content": "\n".join([env["LLM_SYSTEM_PROMPT"]] + system_prompt_extras),
+            "content": "\n".join(final_system_prompt),
         }
     ]
 
@@ -86,6 +91,9 @@ def get_system_prompt():
 @bot.event
 async def on_message(new_msg):
     global msg_nodes, last_task_time
+
+    # Initialize user_warnings at the start of the function
+    user_warnings = set()
 
     # Filter out unwanted messages
     if (
@@ -96,6 +104,49 @@ async def on_message(new_msg):
         or new_msg.author.bot
     ):
         return
+
+    # Remove bot mention from the start of the message
+    content = new_msg.content
+    if content.startswith(f'<@{bot.user.id}>'):
+        content = content.replace(f'<@{bot.user.id}>', '', 1).strip()
+
+    # Check for "/models" command
+    if content.strip().lower() == "/models":
+        # Create an embed with the list of models
+        embed = discord.Embed(title="Available Models", color=discord.Color.blue())
+        
+        # Add default model (router)
+        embed.add_field(name="Default Model (Router)", value=env["LLM"], inline=False)
+        
+        # Add allowed models
+        models_list = "\n".join(f"• {model}" for model in sorted(ALLOWED_MODELS))
+        embed.add_field(name="Allowed Models", value=models_list, inline=False)
+        
+        # Add usage instructions
+        embed.add_field(name="Usage", value="To use a specific model, start your message with:\n`/model model_name`", inline=False)
+        
+        await new_msg.channel.send(embed=embed)
+        return  # Exit the function after sending the model list
+
+    # Check for model command
+    user_specified_model = None
+    if content.startswith('/model'):
+        parts = content.split(None, 2)
+        if len(parts) >= 2:
+            user_specified_model = parts[1]
+            content = parts[2] if len(parts) > 2 else ""
+    
+    # Validate the model
+    if user_specified_model in ALLOWED_MODELS:
+        model = user_specified_model
+    else:
+        model = env["LLM"]
+        if user_specified_model:
+            user_warnings.add(f"⚠️ Invalid model specified: {user_specified_model}. Using default model.")
+
+    # Update new_msg.content with the processed content
+    new_msg.content = content
+
 
     # Build message reply chain and set user warnings
     reply_chain = []
@@ -117,7 +168,7 @@ async def on_message(new_msg):
                     text = text.replace(bot.user.mention, "", 1).lstrip()
 
                 if LLM_SUPPORTS_IMAGES and good_attachments["image"][:MAX_IMAGES]:
-                    content = ([{"type": "text", "text": text[:MAX_TEXT]}] if text[:MAX_TEXT] else []) + [
+                    content = ([{"type": "text", "text": f"user_{curr_msg.author.id} said: {text[:MAX_TEXT]}"}] if text[:MAX_TEXT] else []) + [
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:{att.content_type};base64,{base64.b64encode(requests.get(att.url).content).decode('utf-8')}"},
@@ -125,14 +176,12 @@ async def on_message(new_msg):
                         for att in good_attachments["image"][:MAX_IMAGES]
                     ]
                 else:
-                    content = text[:MAX_TEXT]
+                    content = f"user_{curr_msg.author.id} said: {text[:MAX_TEXT]}"
 
                 data = {
                     "content": content,
                     "role": "assistant" if curr_msg.author == bot.user else "user",
                 }
-                if LLM_SUPPORTS_NAMES:
-                    data["name"] = str(curr_msg.author.id)
 
                 curr_node.data = data
                 curr_node.too_much_text = len(text) > MAX_TEXT
@@ -184,7 +233,15 @@ async def on_message(new_msg):
     response_contents = []
     prev_chunk = None
     edit_task = None
-    kwargs = dict(model=env["LLM"], messages=(get_system_prompt() + reply_chain[::-1]), stream=True) | llm_settings
+    kwargs = dict(model=model,
+                  api_base=env["BASE_URL"],
+                  api_key=env["API_KEY"],
+                  custom_llm_provider="openai",
+                  messages=(get_system_prompt() + reply_chain[::-1]), 
+                  stream=True,
+                  temperature=TEMPERATURE,
+                  max_tokens=MAX_TOKENS
+                  )
     try:
         async with new_msg.channel.typing():
             async for curr_chunk in await acompletion(**kwargs):
@@ -194,6 +251,7 @@ async def on_message(new_msg):
                     if not response_msgs or len(response_contents[-1] + prev_content) > EMBED_MAX_LENGTH:
                         reply_to_msg = new_msg if not response_msgs else response_msgs[-1]
                         embed = discord.Embed(description="⏳", color=EMBED_COLOR["incomplete"])
+                        embed.add_field(name="Model", value=model, inline=False)
                         for warning in sorted(user_warnings):
                             embed.add_field(name=warning, value="", inline=False)
                         response_msgs += [
@@ -238,7 +296,6 @@ async def on_message(new_msg):
         for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
             async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
                 del msg_nodes[msg_id]
-
 
 async def main():
     await bot.start(env["DISCORD_BOT_TOKEN"])
